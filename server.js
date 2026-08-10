@@ -4,16 +4,16 @@ const crypto = require('crypto');
 
 const {
   SHOPIFY_STORE,
-  SHOPIFY_ADMIN_TOKEN,
-  SHOPIFY_APP_PROXY_SECRET,
+  SHOPIFY_CLIENT_ID,
+  SHOPIFY_CLIENT_SECRET,
   PORT = 3000,
 } = process.env;
 
 // Bump this each quarter — see https://shopify.dev/docs/api/usage/versioning
 const API_VERSION = '2026-07';
 
-if (!SHOPIFY_STORE || !SHOPIFY_ADMIN_TOKEN) {
-  console.error('Missing SHOPIFY_STORE or SHOPIFY_ADMIN_TOKEN in your .env file.');
+if (!SHOPIFY_STORE || !SHOPIFY_CLIENT_ID || !SHOPIFY_CLIENT_SECRET) {
+  console.error('Missing SHOPIFY_STORE, SHOPIFY_CLIENT_ID, or SHOPIFY_CLIENT_SECRET in your .env file.');
   process.exit(1);
 }
 
@@ -22,12 +22,51 @@ const app = express();
 app.use(express.json({ limit: '15mb' }));
 
 /**
+ * Shopify no longer hands out a static Admin API token you copy once
+ * (that flow was retired Jan 1 2026). Instead, this server exchanges its
+ * Client ID + Client Secret for a short-lived access token itself, using
+ * the client credentials grant. Tokens last 24h, so we cache and refresh
+ * automatically — nothing for you to manage by hand.
+ * https://shopify.dev/docs/apps/build/authentication-authorization/access-tokens/client-credentials-grant
+ */
+let cachedToken = null; // { token, expiresAt }
+
+async function getAccessToken() {
+  if (cachedToken && cachedToken.expiresAt > Date.now() + 60_000) {
+    return cachedToken.token;
+  }
+
+  const res = await fetch(`https://${SHOPIFY_STORE}/admin/oauth/access_token`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({
+      grant_type: 'client_credentials',
+      client_id: SHOPIFY_CLIENT_ID,
+      client_secret: SHOPIFY_CLIENT_SECRET,
+    }).toString(),
+  });
+
+  if (!res.ok) {
+    const text = await res.text();
+    throw new Error(`Failed to get access token: ${res.status} ${text}`);
+  }
+
+  const data = await res.json();
+  cachedToken = {
+    token: data.access_token,
+    expiresAt: Date.now() + data.expires_in * 1000,
+  };
+  return cachedToken.token;
+}
+
+/**
  * Verifies that a request actually came through Shopify's App Proxy for
- * your store, not from someone hitting this endpoint directly.
- * https://shopify.dev/docs/apps/build/online-store/display-dynamic-data#verify-the-app-proxy-signature
+ * your store, not from someone hitting this endpoint directly. Shopify
+ * signs proxy requests using the app's own Client Secret — the same one
+ * used to get an access token, no separate secret involved.
+ * https://shopify.dev/docs/apps/build/online-store/app-proxies/authenticate-app-proxies
  */
 function verifyAppProxySignature(req) {
-  if (!SHOPIFY_APP_PROXY_SECRET) return true; // allow through in local/dev testing
   const { signature, ...rest } = req.query;
   if (!signature) return false;
 
@@ -40,7 +79,7 @@ function verifyAppProxySignature(req) {
     .join('');
 
   const digest = crypto
-    .createHmac('sha256', SHOPIFY_APP_PROXY_SECRET)
+    .createHmac('sha256', SHOPIFY_CLIENT_SECRET)
     .update(message)
     .digest('hex');
 
@@ -48,11 +87,12 @@ function verifyAppProxySignature(req) {
 }
 
 async function shopifyGraphQL(query, variables) {
+  const token = await getAccessToken();
   const res = await fetch(`https://${SHOPIFY_STORE}/admin/api/${API_VERSION}/graphql.json`, {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
-      'X-Shopify-Access-Token': SHOPIFY_ADMIN_TOKEN,
+      'X-Shopify-Access-Token': token,
     },
     body: JSON.stringify({ query, variables }),
   });
